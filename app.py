@@ -1,8 +1,10 @@
 """
 Detector y Reconocedor de Objetos — con detección de manos primero
 ===================================================================
+Compatible con MediaPipe >= 0.10 (Tasks API).
+
 Flujo:
-  1. MediaPipe detecta manos en el frame completo.
+  1. MediaPipe HandLandmarker detecta manos en el frame completo.
   2. Dentro de la zona de captura (centro), se enmascara la piel de las manos
      para aislar solo el objeto que se sostiene.
   3. Las características se extraen ÚNICAMENTE del objeto (sin piel).
@@ -15,63 +17,107 @@ Controles:
 
 import cv2
 import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
+from mediapipe.tasks.python.vision import HandLandmarkerOptions
+from mediapipe.framework.formats import landmark_pb2
 import numpy as np
 import os
 import pickle
 import time
+import urllib.request
 
 # ──────────────────────────────────────────────
 #  CONFIGURACIÓN GLOBAL
 # ──────────────────────────────────────────────
 DB_FILE       = "objetos_aprendidos.pkl"
-MIN_MUESTRAS  = 8        # muestras mínimas para reconocer
-UMBRAL_SIM    = 0.30     # similitud mínima para confirmar reconocimiento
-REGION_W      = 340      # ancho de la zona de captura central
-REGION_H      = 340      # alto  de la zona de captura central
-SKIN_BLUR     = 15       # suavizado de la máscara de piel
-MIN_OBJ_AREA  = 1500     # área mínima del objeto (px²) para considerar captura válida
+MIN_MUESTRAS  = 8
+UMBRAL_SIM    = 0.30
+REGION_W      = 340
+REGION_H      = 340
+SKIN_BLUR     = 15
+MIN_OBJ_AREA  = 1500
 
-# Rango de piel en HSV
+MODEL_PATH    = "hand_landmarker.task"
+MODEL_URL     = (
+    "https://storage.googleapis.com/mediapipe-models/"
+    "hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+)
+
 PIEL_BAJO  = np.array([0,  20,  60],  dtype=np.uint8)
 PIEL_ALTO  = np.array([25, 255, 255], dtype=np.uint8)
 
+# Conexiones de mano para dibujo manual (índices de landmarks)
+HAND_CONNECTIONS = [
+    (0,1),(1,2),(2,3),(3,4),
+    (0,5),(5,6),(6,7),(7,8),
+    (5,9),(9,10),(10,11),(11,12),
+    (9,13),(13,14),(14,15),(15,16),
+    (13,17),(17,18),(18,19),(19,20),
+    (0,17),
+]
+
 
 # ──────────────────────────────────────────────
-#  INICIALIZACIÓN MEDIAPIPE
+#  DESCARGA DEL MODELO
+# ──────────────────────────────────────────────
+def descargar_modelo() -> None:
+    """Descarga el modelo hand_landmarker.task si no existe."""
+    if os.path.exists(MODEL_PATH):
+        return
+    print(f"Descargando modelo de manos ({MODEL_PATH})...")
+    try:
+        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+        print("  Modelo descargado correctamente.")
+    except Exception as e:
+        print(f"  ERROR al descargar el modelo: {e}")
+        print(f"  Descárgalo manualmente de:\n  {MODEL_URL}")
+        raise
+
+
+# ──────────────────────────────────────────────
+#  INICIALIZACIÓN MEDIAPIPE (Tasks API >= 0.10)
 # ──────────────────────────────────────────────
 def crear_detector_manos():
-    """Inicializa y devuelve el detector de manos de MediaPipe."""
-    mp_hands = mp.solutions.hands
-    detector = mp_hands.Hands(
-        static_image_mode=False,
-        max_num_hands=2,
-        min_detection_confidence=0.6,
+    """
+    Crea un HandLandmarker en modo IMAGE (síncrono, adecuado para bucle).
+    Devuelve el detector listo para usar.
+    """
+    descargar_modelo()
+    base_options = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
+    options = HandLandmarkerOptions(
+        base_options=base_options,
+        running_mode=mp_vision.RunningMode.IMAGE,
+        num_hands=2,
+        min_hand_detection_confidence=0.6,
+        min_hand_presence_confidence=0.5,
         min_tracking_confidence=0.5,
     )
-    return detector, mp_hands
+    return mp_vision.HandLandmarker.create_from_options(options)
 
 
 # ──────────────────────────────────────────────
 #  DETECCIÓN DE MANOS
 # ──────────────────────────────────────────────
 def detectar_manos(frame: np.ndarray, detector) -> object:
-    """Procesa el frame y devuelve los resultados de MediaPipe."""
+    """Procesa el frame (BGR) y devuelve HandLandmarkerResult."""
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    return detector.process(rgb)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+    return detector.detect(mp_image)
 
 
 def obtener_bbox_manos(results, frame_shape: tuple) -> list:
     """
-    Devuelve una lista de bounding boxes (x1,y1,x2,y2) de cada mano detectada,
-    expandidas un 15% para cubrir bien la palma y muñeca.
+    Devuelve lista de bounding boxes (x1,y1,x2,y2) de cada mano,
+    expandidas 15 % para cubrir bien la palma y la muñeca.
     """
     h, w = frame_shape[:2]
     bboxes = []
-    if not results.multi_hand_landmarks:
+    if not results.hand_landmarks:
         return bboxes
-    for hand_lm in results.multi_hand_landmarks:
-        xs = [lm.x * w for lm in hand_lm.landmark]
-        ys = [lm.y * h for lm in hand_lm.landmark]
+    for hand_lm in results.hand_landmarks:
+        xs = [lm.x * w for lm in hand_lm]
+        ys = [lm.y * h for lm in hand_lm]
         pad_x = (max(xs) - min(xs)) * 0.15
         pad_y = (max(ys) - min(ys)) * 0.15
         x1 = max(0, int(min(xs) - pad_x))
@@ -82,26 +128,24 @@ def obtener_bbox_manos(results, frame_shape: tuple) -> list:
     return bboxes
 
 
-def dibujar_manos(frame: np.ndarray, results, mp_hands) -> None:
-    """Dibuja landmarks y conexiones de manos sobre el frame."""
-    mp_draw   = mp.solutions.drawing_utils
-    mp_styles = mp.solutions.drawing_styles
-    if not results.multi_hand_landmarks:
+def dibujar_manos(frame: np.ndarray, results) -> None:
+    """Dibuja landmarks y conexiones de manos sobre el frame (sin mp_draw)."""
+    if not results.hand_landmarks:
         return
-    for hand_lm in results.multi_hand_landmarks:
-        mp_draw.draw_landmarks(
-            frame, hand_lm,
-            mp_hands.HAND_CONNECTIONS,
-            mp_styles.get_default_hand_landmarks_style(),
-            mp_styles.get_default_hand_connections_style(),
-        )
+    h, w = frame.shape[:2]
+    for hand_lm in results.hand_landmarks:
+        pts = [(int(lm.x * w), int(lm.y * h)) for lm in hand_lm]
+        for (a, b) in HAND_CONNECTIONS:
+            cv2.line(frame, pts[a], pts[b], (0, 200, 255), 1)
+        for pt in pts:
+            cv2.circle(frame, pt, 3, (255, 255, 255), -1)
+            cv2.circle(frame, pt, 3, (0, 150, 200),   1)
 
 
 # ──────────────────────────────────────────────
 #  ZONA DE CAPTURA (ROI)
 # ──────────────────────────────────────────────
 def coords_roi(frame_shape: tuple) -> tuple:
-    """Calcula las coordenadas de la zona de captura central."""
     h, w = frame_shape[:2]
     cx, cy = w // 2, h // 2
     x1 = cx - REGION_W // 2
@@ -110,7 +154,6 @@ def coords_roi(frame_shape: tuple) -> tuple:
 
 
 def recortar_roi(frame: np.ndarray) -> tuple:
-    """Devuelve (roi_imagen, (x1,y1,x2,y2))."""
     coords = coords_roi(frame.shape)
     x1, y1, x2, y2 = coords
     return frame[y1:y2, x1:x2].copy(), coords
@@ -120,20 +163,13 @@ def recortar_roi(frame: np.ndarray) -> tuple:
 #  MÁSCARA DE PIEL / AISLAMIENTO DEL OBJETO
 # ──────────────────────────────────────────────
 def mascara_piel(roi: np.ndarray) -> np.ndarray:
-    """
-    Genera una máscara binaria de los píxeles de piel dentro del ROI.
-    Combina rango HSV + rango YCrCb para mayor robustez.
-    """
     hsv  = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     ycr  = cv2.cvtColor(roi, cv2.COLOR_BGR2YCrCb)
-
     m_hsv = cv2.inRange(hsv, PIEL_BAJO, PIEL_ALTO)
     m_ycr = cv2.inRange(ycr,
                         np.array([0,  133,  77], dtype=np.uint8),
                         np.array([255, 173, 127], dtype=np.uint8))
     mask = cv2.bitwise_or(m_hsv, m_ycr)
-
-    # Dilatar para cubrir bordes de dedos + suavizar
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (SKIN_BLUR, SKIN_BLUR))
     mask   = cv2.dilate(mask, kernel, iterations=2)
     mask   = cv2.GaussianBlur(mask, (SKIN_BLUR, SKIN_BLUR), 0)
@@ -143,24 +179,11 @@ def mascara_piel(roi: np.ndarray) -> np.ndarray:
 
 def aislar_objeto(roi: np.ndarray, hand_bboxes_global: list,
                   roi_coords: tuple) -> tuple:
-    """
-    Dado el ROI y las bboxes de manos en coordenadas globales, construye
-    una máscara que elimina las manos y deja solo el objeto.
-
-    Retorna:
-      - roi_objeto : imagen del ROI con las manos en negro
-      - mascara_obj: máscara binaria del objeto (255 = objeto)
-      - area_objeto : área en píxeles del objeto visible
-    """
     rx1, ry1, rx2, ry2 = roi_coords
-
-    # Máscara de piel sobre el ROI
     m_piel = mascara_piel(roi)
 
-    # Añadir las bboxes de manos detectadas por MediaPipe (más fiable que solo color)
     m_manos = np.zeros(roi.shape[:2], dtype=np.uint8)
     for (hx1, hy1, hx2, hy2) in hand_bboxes_global:
-        # Convertir a coordenadas locales del ROI
         lx1 = max(0, hx1 - rx1)
         ly1 = max(0, hy1 - ry1)
         lx2 = min(REGION_W, hx2 - rx1)
@@ -168,18 +191,13 @@ def aislar_objeto(roi: np.ndarray, hand_bboxes_global: list,
         if lx2 > lx1 and ly2 > ly1:
             m_manos[ly1:ly2, lx1:lx2] = 255
 
-    # Unir ambas máscaras de "lo que son manos"
     m_excluir = cv2.bitwise_or(m_piel, m_manos)
+    m_objeto  = cv2.bitwise_not(m_excluir)
 
-    # El objeto es lo que NO son manos
-    m_objeto = cv2.bitwise_not(m_excluir)
-
-    # Limpiar ruido
     kernel   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     m_objeto = cv2.morphologyEx(m_objeto, cv2.MORPH_OPEN,  kernel)
     m_objeto = cv2.morphologyEx(m_objeto, cv2.MORPH_CLOSE, kernel)
 
-    # Quedarse con el contorno más grande (el objeto principal)
     contornos, _ = cv2.findContours(m_objeto, cv2.RETR_EXTERNAL,
                                     cv2.CHAIN_APPROX_SIMPLE)
     m_final = np.zeros_like(m_objeto)
@@ -190,7 +208,6 @@ def aislar_objeto(roi: np.ndarray, hand_bboxes_global: list,
         if area >= MIN_OBJ_AREA:
             cv2.drawContours(m_final, [mayor], -1, 255, -1)
 
-    # Aplicar máscara al ROI
     roi_objeto = cv2.bitwise_and(roi, roi, mask=m_final)
     return roi_objeto, m_final, area
 
@@ -199,7 +216,6 @@ def aislar_objeto(roi: np.ndarray, hand_bboxes_global: list,
 #  EXTRACCIÓN DE CARACTERÍSTICAS
 # ──────────────────────────────────────────────
 def extraer_histograma(roi: np.ndarray, mascara: np.ndarray) -> np.ndarray:
-    """Histograma HSV normalizado usando solo los píxeles del objeto."""
     hsv  = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     hist = cv2.calcHist([hsv], [0, 1], mascara,
                         [36, 32], [0, 180, 0, 256])
@@ -208,7 +224,6 @@ def extraer_histograma(roi: np.ndarray, mascara: np.ndarray) -> np.ndarray:
 
 
 def extraer_hog(roi: np.ndarray) -> np.ndarray:
-    """Descriptor HOG lite sobre la zona del objeto (64×64)."""
     gris    = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     resized = cv2.resize(gris, (64, 64))
     gx      = cv2.Sobel(resized, cv2.CV_32F, 1, 0, ksize=3)
@@ -230,7 +245,6 @@ def extraer_hog(roi: np.ndarray) -> np.ndarray:
 
 
 def extraer_momentos(mascara: np.ndarray) -> np.ndarray:
-    """Hu Moments de la forma del objeto (7 valores, invariantes a escala/rotación)."""
     M  = cv2.moments(mascara)
     hu = cv2.HuMoments(M).flatten()
     hu = -np.sign(hu) * np.log10(np.abs(hu) + 1e-10)
@@ -239,10 +253,6 @@ def extraer_momentos(mascara: np.ndarray) -> np.ndarray:
 
 
 def extraer_caracteristicas(roi_obj: np.ndarray, mascara: np.ndarray):
-    """
-    Extrae color, forma (HOG) y momentos de Hu del objeto aislado.
-    Devuelve None si el objeto es demasiado pequeño.
-    """
     if mascara is None or cv2.countNonZero(mascara) < MIN_OBJ_AREA:
         return None
     return {
@@ -270,7 +280,6 @@ def similitud_coseno(v1: np.ndarray, v2: np.ndarray) -> float:
 
 
 def comparar_muestra(q: dict, m: dict) -> float:
-    """Score ponderado: 50% color + 30% HOG + 20% momentos."""
     sc = similitud_color(q["color"],     m["color"])
     sf = similitud_coseno(q["forma"],    m["forma"])
     sh = similitud_coseno(q["momentos"], m["momentos"])
@@ -278,7 +287,6 @@ def comparar_muestra(q: dict, m: dict) -> float:
 
 
 def reconocer_objeto(feats: dict, db: dict) -> tuple:
-    """Busca el mejor match en la BD. Devuelve (nombre, confianza)."""
     mejor, score = "Desconocido", 0.0
     for nombre, muestras in db.items():
         if len(muestras) < MIN_MUESTRAS:
@@ -317,7 +325,6 @@ def limpiar_base_datos() -> dict:
 
 def agregar_muestra(db: dict, nombre: str,
                     roi_obj: np.ndarray, mascara: np.ndarray) -> bool:
-    """Intenta añadir una muestra. Devuelve True si fue válida."""
     feats = extraer_caracteristicas(roi_obj, mascara)
     if feats is None:
         return False
@@ -331,7 +338,6 @@ def agregar_muestra(db: dict, nombre: str,
 # ──────────────────────────────────────────────
 def dibujar_zona_captura(frame: np.ndarray, coords: tuple,
                          color: tuple, label: str = "") -> None:
-    """Dibuja el recuadro de la zona de captura con esquinas estilizadas."""
     x1, y1, x2, y2 = coords
     L = 22
     for (sx, sy, dx, dy) in [(x1,y1,1,1),(x2,y1,-1,1),(x1,y2,1,-1),(x2,y2,-1,-1)]:
@@ -347,16 +353,13 @@ def dibujar_panel_superior(frame: np.ndarray, modo: str,
                             db: dict) -> None:
     h, w = frame.shape[:2]
     cv2.rectangle(frame, (0, 0), (w, 52), (15, 15, 15), -1)
-
     color_modo = (0, 210, 100) if modo == "APRENDIZAJE" else (80, 170, 255)
     cv2.putText(frame, f"MODO: {modo}", (10, 35),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.75, color_modo, 2)
-
     estado_m = f"Manos: {manos}" if manos else "Sin manos"
     color_m  = (0, 200, 80) if manos else (60, 60, 200)
     cv2.putText(frame, estado_m, (w // 2 - 50, 35),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.65, color_m, 2)
-
     info = f"Obj: {len(db)}  Muestras: {sum(len(v) for v in db.values())}"
     cv2.putText(frame, info, (w - 290, 35),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.52, (160, 160, 160), 1)
@@ -417,7 +420,6 @@ def dibujar_resultado_reconocimiento(frame: np.ndarray,
     cx    = (w - ts[0]) // 2
     cv2.putText(frame, label, (cx, ry2 + 38),
                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
-    # Barra de confianza
     bw, bh = 220, 10
     bx, by = (w - bw) // 2, ry2 + 50
     cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), (40, 40, 40), -1)
@@ -426,7 +428,6 @@ def dibujar_resultado_reconocimiento(frame: np.ndarray,
 
 def dibujar_contorno_objeto(frame: np.ndarray, mascara: np.ndarray,
                              roi_coords: tuple) -> None:
-    """Dibuja el contorno del objeto detectado en coordenadas globales."""
     if mascara is None or cv2.countNonZero(mascara) == 0:
         return
     rx1, ry1 = roi_coords[0], roi_coords[1]
@@ -446,7 +447,6 @@ def mostrar_flash(frame: np.ndarray) -> None:
 
 def dibujar_aviso_sin_objeto(frame: np.ndarray, roi_coords: tuple,
                               area: int, n_manos: int) -> None:
-    """Aviso si el objeto no es visible o no hay manos."""
     x1, y1 = roi_coords[0], roi_coords[1]
     if n_manos == 0:
         cv2.putText(frame, "Coloca tus manos con el objeto en la zona",
@@ -498,11 +498,14 @@ def main() -> None:
     msg_ts           = 0.0
     ultimo_resultado = ("", 0.0)
 
-    detector, mp_hands = crear_detector_manos()
+    print("Inicializando detector de manos...")
+    detector = crear_detector_manos()
+    print("  Detector listo.")
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("Error: No se pudo acceder a la camara.")
+        detector.close()
         return
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
@@ -521,19 +524,19 @@ def main() -> None:
             break
         frame = cv2.flip(frame, 1)
 
-        # ── 1. Detectar manos en frame completo ───────────────
+        # ── 1. Detectar manos ─────────────────────────────────
         results  = detectar_manos(frame, detector)
-        n_manos  = len(results.multi_hand_landmarks) if results.multi_hand_landmarks else 0
+        n_manos  = len(results.hand_landmarks) if results.hand_landmarks else 0
         bboxes_m = obtener_bbox_manos(results, frame.shape)
 
-        # ── 2. Recortar ROI central ───────────────────────────
+        # ── 2. ROI central ────────────────────────────────────
         roi, roi_coords = recortar_roi(frame)
 
-        # ── 3. Aislar objeto dentro del ROI ───────────────────
+        # ── 3. Aislar objeto ──────────────────────────────────
         roi_obj, mascara_obj, area_obj = aislar_objeto(roi, bboxes_m, roi_coords)
 
         # ── 4. Lógica de modo ─────────────────────────────────
-        color_zona = (0, 210, 100)   # verde = aprendizaje
+        color_zona = (0, 210, 100)
 
         if modo == "RECONOCIMIENTO":
             color_zona = (80, 170, 255)
@@ -551,34 +554,27 @@ def main() -> None:
             flash_activo = False
 
         # ── 5. Elementos visuales ─────────────────────────────
-        # Landmarks de manos
-        dibujar_manos(frame, results, mp_hands)
+        dibujar_manos(frame, results)
 
-        # BBoxes de manos (overlay semitransparente)
         for (hx1, hy1, hx2, hy2) in bboxes_m:
             overlay = frame.copy()
             cv2.rectangle(overlay, (hx1, hy1), (hx2, hy2), (0, 200, 255), -1)
             cv2.addWeighted(overlay, 0.08, frame, 0.92, 0, frame)
             cv2.rectangle(frame, (hx1, hy1), (hx2, hy2), (0, 200, 255), 1)
 
-        # Contorno del objeto aislado
         dibujar_contorno_objeto(frame, mascara_obj, roi_coords)
 
-        # Zona de captura
         etiq_zona = "ZONA DE CAPTURA" if n_manos else "Coloca manos aqui"
         dibujar_zona_captura(frame, roi_coords, color_zona, etiq_zona)
 
-        # Avisos
         dibujar_aviso_sin_objeto(frame, roi_coords, area_obj, n_manos)
 
-        # HUD completo
         msg_show = msg_tmp if time.time() - msg_ts < 2.5 else ""
         dibujar_panel_superior(frame, modo, n_manos, objeto_actual, db)
         dibujar_estado_inferior(frame, objeto_actual, db, msg_show)
         dibujar_lista_objetos(frame, db, objeto_actual)
         dibujar_leyenda(frame)
 
-        # Debug: área del objeto
         cv2.putText(frame, f"obj area: {area_obj}px",
                     (roi_coords[0], roi_coords[3] + 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.40, (80, 80, 80), 1)
@@ -591,16 +587,13 @@ def main() -> None:
         if key == ord('q'):
             print("Saliendo...")
             break
-
         elif key == ord('l'):
             modo = "APRENDIZAJE"
             print("[MODO] Aprendizaje")
-
         elif key == ord('r'):
             modo = "RECONOCIMIENTO"
             ultimo_resultado = ("", 0.0)
             print("[MODO] Reconocimiento")
-
         elif key == ord('n'):
             nombre = pedir_nombre_objeto()
             if nombre:
@@ -613,7 +606,6 @@ def main() -> None:
                 print(f"[NUEVO] '{nombre}'")
             else:
                 print("[INFO] Cancelado.")
-
         elif key == ord('s'):
             if modo != "APRENDIZAJE":
                 msg_tmp = "Cambia a Aprendizaje con [L]"
@@ -639,7 +631,6 @@ def main() -> None:
                 else:
                     msg_tmp = "Muestra invalida, intenta de nuevo."
                     msg_ts  = time.time()
-
         elif key == ord('c'):
             db = limpiar_base_datos()
             objeto_actual    = ""
