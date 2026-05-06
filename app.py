@@ -15,12 +15,13 @@ Controles:
   [C] - Limpiar BD         [Q] - Salir
 """
 
+
+
 import cv2
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
 from mediapipe.tasks.python.vision import HandLandmarkerOptions
-from mediapipe.framework.formats import landmark_pb2
 import numpy as np
 import os
 import pickle
