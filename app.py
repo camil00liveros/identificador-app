@@ -15,6 +15,8 @@ Controles:
   [C] - Limpiar BD         [Q] - Salir
 """
 
+
+
 import cv2
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
